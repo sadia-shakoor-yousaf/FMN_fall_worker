@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+
+# Large / downloaded weights (LSTM ckpt in artifacts/ is tracked; YOLO is not)
+*.pt
+!artifacts/fall_lstm_urfd_all.pt
+yolo*.pt
+
+# Runtime outputs
+data/live_logs/**
+!data/live_logs/.gitkeep
+data/mock_events/**
+!data/mock_events/.gitkeep
+data/samples/**
+!data/samples/.gitkeep
+
+.env
+*.log
