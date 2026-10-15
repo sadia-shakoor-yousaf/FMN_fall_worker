@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -90,6 +91,24 @@ def _draw_overlay(
     return out
 
 
+PREVIEW_MAX_W = 960
+
+
+def _show_preview(frame: np.ndarray) -> None:
+    """Fit the preview on screen without stretching the picture."""
+    h, w = frame.shape[:2]
+    if w > PREVIEW_MAX_W:
+        scale = PREVIEW_MAX_W / float(w)
+        disp_w = PREVIEW_MAX_W
+        disp_h = max(int(round(h * scale)), 1)
+    else:
+        disp_w, disp_h = w, h
+    name = "ForgetMeNot fall worker"
+    cv2.namedWindow(name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    cv2.resizeWindow(name, disp_w, disp_h)
+    cv2.imshow(name, frame)
+
+
 def _open_writer(path: Path, frame: np.ndarray, fps: float) -> cv2.VideoWriter:
     path.parent.mkdir(parents=True, exist_ok=True)
     h, w = frame.shape[:2]
@@ -122,21 +141,31 @@ def parse_args() -> argparse.Namespace:
         "--cam",
         type=int,
         default=None,
-        help="Camera index. Default: USB/JLC webcam (not the laptop camera).",
+        help="Camera index. Default: USB/JLB webcam (not the laptop camera).",
     )
     p.add_argument(
         "--cam-name",
         type=str,
         default=None,
-        help='Substring of the device name, e.g. "USB 2.0" or "JLC"',
+        help='Substring of the device name, e.g. "USB 2.0" or "JLB"',
     )
     p.add_argument(
         "--list-cams",
         action="store_true",
         help="Print camera indexes and names, then exit",
     )
-    p.add_argument("--width", type=int, default=1920, help="Capture width (JLC 1080p)")
-    p.add_argument("--height", type=int, default=1080, help="Capture height")
+    p.add_argument(
+        "--width",
+        type=int,
+        default=0,
+        help="Capture width. 0 = webcam default (same view as the Camera app).",
+    )
+    p.add_argument(
+        "--height",
+        type=int,
+        default=0,
+        help="Capture height. 0 = webcam default.",
+    )
     p.add_argument(
         "--source",
         type=str,
@@ -287,6 +316,22 @@ def main() -> int:
     fps_ema = 0.0
     alert_flash_until = 0.0
     pending_alert: dict | None = None
+    empty_reads = 0
+    post_threads: list[threading.Thread] = []
+
+    def _send_fall(url: str, patient_id: int, confidence: float) -> None:
+        try:
+            posted = post_event(
+                url,
+                patient_id=patient_id,
+                event_type="fall_detected",
+                label="floor_down",
+                confidence=confidence,
+                source="room_cam",
+            )
+            log.info("POST fall_detected ok id=%s", posted.get("id", "?"))
+        except FmnClientError as e:
+            log.warning("POST fall_detected failed: %s", e)
 
     def _flush_alert(pending: dict) -> None:
         _write_clip(pending["frames"], pending["path"], write_fps)
@@ -300,9 +345,20 @@ def main() -> int:
     try:
         while True:
             ok, frame = cap.read()
-            if not ok:
-                log.info("end of stream")
-                break
+            if not ok or frame is None:
+                # A video file really ended. A JLB webcam often returns one
+                # empty read while DirectShow recovers; quitting here drops
+                # the fall before the event is posted.
+                if args.source is not None:
+                    log.info("end of stream")
+                    break
+                empty_reads += 1
+                if empty_reads >= 50:
+                    log.error("camera stopped delivering frames")
+                    break
+                time.sleep(0.02)
+                continue
+            empty_reads = 0
             n_read += 1
             if (n_read - 1) % skip != 0:
                 continue
@@ -337,6 +393,25 @@ def main() -> int:
             if event is not None and pending_alert is None:
                 alert_flash_until = now + 2.5
                 flashing = True
+                log.warning(
+                    "FALL ALERT patient_id=%s conf=%.3f frame=%d",
+                    args.patient_id or "(none)",
+                    event.confidence,
+                    event.frame_idx,
+                )
+                # Post before clip setup. A blocking HTTP call on this thread
+                # stalls DirectShow and the JLB webcam drops the stream.
+                if post_enabled and args.patient_id:
+                    worker = threading.Thread(
+                        target=_send_fall,
+                        args=(api_url, int(args.patient_id), float(event.confidence)),
+                        name="fall-event-post",
+                        daemon=False,
+                    )
+                    worker.start()
+                    post_threads.append(worker)
+                elif post_enabled and not args.patient_id:
+                    log.warning("skip POST: --patient-id required")
                 clip_path = args.log_dir / f"alert_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
                 pending_alert = {
                     "path": clip_path,
@@ -346,33 +421,11 @@ def main() -> int:
                     "conf": event.confidence,
                     "frame_idx": event.frame_idx,
                 }
-                log.warning(
-                    "FALL ALERT patient_id=%s conf=%.3f frame=%d "
-                    "(recording +%.0fs post-roll → %s)",
-                    args.patient_id or "(none)",
-                    event.confidence,
-                    event.frame_idx,
+                log.info(
+                    "recording +%.0fs post-roll → %s",
                     ALERT_POST_S,
                     clip_path,
                 )
-                if post_enabled and args.patient_id:
-                    try:
-                        posted = post_event(
-                            api_url,
-                            patient_id=args.patient_id,
-                            event_type="fall_detected",
-                            label="floor_down",
-                            confidence=float(event.confidence),
-                            source="room_cam",
-                        )
-                        log.info(
-                            "POST fall_detected ok id=%s",
-                            posted.get("id", "?"),
-                        )
-                    except FmnClientError as e:
-                        log.warning("POST fall_detected failed: %s", e)
-                elif post_enabled and not args.patient_id:
-                    log.warning("skip POST: --patient-id required")
 
             vis = _draw_overlay(
                 plotted,
@@ -400,7 +453,7 @@ def main() -> int:
                         pending_alert = None
 
             if not args.no_preview:
-                cv2.imshow("ForgetMeNot fall worker", vis)
+                _show_preview(vis)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord("q")):
                     log.info("quit by user")
@@ -410,6 +463,8 @@ def main() -> int:
                 log.info("hit --max-frames=%s", args.max_frames)
                 break
     finally:
+        for worker in post_threads:
+            worker.join(timeout=8)
         if pending_alert is not None:
             _flush_alert(pending_alert)
             pending_alert = None
