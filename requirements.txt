@@ -1,6 +1,9 @@
 # Python 3.11 recommended (3.11–3.12)
-numpy>=1.24.0
-opencv-python>=4.8.0
-torch>=2.1.0
+# Pin torch/numpy: torch 2.14 + NumPy 2.x fails on Windows with c10.dll WinError 1114.
+numpy>=1.24.0,<2
+opencv-python>=4.8.0,<5
+torch==2.5.1
+torchvision==0.20.1
 ultralytics>=8.3.0
 httpx>=0.27.0
+cv2-enumerate-cameras>=1.4.0

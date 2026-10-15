@@ -111,8 +111,10 @@ python scripts/smoke_post.py --api-url http://127.0.0.1:5155 --patient-id 1
 # video file
 python workers/fall_worker.py --source path/to/fall_clip.mp4 --api-url http://127.0.0.1:5155 --patient-id 1
 
-# live webcam
-python workers/fall_worker.py --cam 0 --api-url http://127.0.0.1:5155 --patient-id 1
+# live webcam (auto-picks USB/JLC, not the laptop camera)
+python workers/fall_worker.py --api-url http://127.0.0.1:5155 --patient-id 1
+python workers/fall_worker.py --list-cams
+python workers/fall_worker.py --cam 1 --api-url http://127.0.0.1:5155 --patient-id 1
 ```
 
 On alert you should see `POST fall_detected ok id=...` in the worker log.  

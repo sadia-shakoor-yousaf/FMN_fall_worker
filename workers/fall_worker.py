@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from fall_cv.camera import enumerate_named_cameras, open_camera, resolve_camera_index
 from fall_cv.features import features_from_pose, to_vector
 from fall_cv.fmn_client import DEFAULT_BASE_URL, FmnClientError, post_event
 from fall_cv.live import DEFAULT_NEED, LiveFallDetector, load_lstm_checkpoint
@@ -117,7 +118,25 @@ def _write_clip(frames: list[np.ndarray], path: Path, fps: float) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="ForgetMeNot live fall worker")
-    p.add_argument("--cam", type=int, default=0, help="USB camera index")
+    p.add_argument(
+        "--cam",
+        type=int,
+        default=None,
+        help="Camera index. Default: USB/JLC webcam (not the laptop camera).",
+    )
+    p.add_argument(
+        "--cam-name",
+        type=str,
+        default=None,
+        help='Substring of the device name, e.g. "USB 2.0" or "JLC"',
+    )
+    p.add_argument(
+        "--list-cams",
+        action="store_true",
+        help="Print camera indexes and names, then exit",
+    )
+    p.add_argument("--width", type=int, default=1920, help="Capture width (JLC 1080p)")
+    p.add_argument("--height", type=int, default=1080, help="Capture height")
     p.add_argument(
         "--source",
         type=str,
@@ -174,6 +193,15 @@ def main() -> int:
     args = parse_args()
     log = _setup_log(args.log_dir)
 
+    if args.list_cams:
+        cams = enumerate_named_cameras()
+        if not cams:
+            log.error("no cameras found")
+            return 1
+        for idx, name in cams:
+            log.info("cam %s: %s", idx, name)
+        return 0
+
     if not args.ckpt.is_file():
         log.error(
             "checkpoint missing: %s — see artifacts/README.md",
@@ -206,11 +234,25 @@ def main() -> int:
     )
     pose = load_pose_model(args.pose_model)
 
-    source = args.source if args.source is not None else args.cam
-    cap = cv2.VideoCapture(source)
+    cam_label = None
+    if args.source is not None:
+        source = args.source
+        cap = cv2.VideoCapture(source)
+    else:
+        try:
+            cam_index, cam_label = resolve_camera_index(args.cam, args.cam_name)
+        except RuntimeError as e:
+            log.error("%s", e)
+            return 1
+        source = cam_index
+        cap = open_camera(cam_index, args.width, args.height)
     if not cap.isOpened():
         log.error("cannot open source: %s", source)
         return 1
+    got_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    got_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    if cam_label:
+        log.info("camera %s (%s) %sx%s", source, cam_label, got_w, got_h)
 
     cam_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     if cam_fps < 1:
